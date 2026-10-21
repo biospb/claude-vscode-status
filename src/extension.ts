@@ -30,6 +30,14 @@ interface BridgePayload {
   };
 }
 
+interface LiveSession {
+  sessionId: string;
+  cwd?: string;
+  status?: string;
+  statusUpdatedAt?: number;
+  updatedAt?: number;
+}
+
 interface TokenUsage {
   input_tokens?: number;
   output_tokens?: number;
@@ -46,6 +54,7 @@ interface NativeTranscriptStatus {
   entrypoint: string;
   modelId?: string;
   modelName: string;
+  title?: string;
   effort?: string;
   usage: TokenUsage;
   contextTokens?: number;
@@ -60,6 +69,7 @@ interface DisplayStatus {
   cwd?: string;
   updatedAt?: number;
   modelName: string;
+  title?: string;
   effort?: string;
   usage?: TokenUsage;
   contextTokens?: number;
@@ -72,10 +82,12 @@ interface DisplayStatus {
   version?: string;
   pinned: boolean;
   sourceDetail: string;
+  via?: string;
 }
 
 const CLAUDE_DIR = path.join(os.homedir(), '.claude');
 const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
+const SESSIONS_DIR = path.join(CLAUDE_DIR, 'sessions');
 const BRIDGE_DIR = path.join(CLAUDE_DIR, 'vscode-status');
 const BRIDGE_SESSIONS_DIR = path.join(BRIDGE_DIR, 'sessions');
 const LEGACY_EVENTS_FILE = path.join(BRIDGE_DIR, 'events.jsonl');
@@ -91,10 +103,15 @@ let statusItem: vscode.StatusBarItem;
 let pollTimer: NodeJS.Timeout | undefined;
 let extensionContext: vscode.ExtensionContext;
 let lastFingerprint = '';
+let log: vscode.OutputChannel | undefined;
+let debugEnabled = false;
+function dbg(msg: string) { if (debugEnabled) log?.appendLine(msg); }
 const nativeTranscriptCache = new Map<string, { mtimeMs: number; status?: NativeTranscriptStatus }>();
 
 export function activate(context: vscode.ExtensionContext) {
   extensionContext = context;
+  log = vscode.window.createOutputChannel('Claude Code Status');
+  context.subscriptions.push(log);
   statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   statusItem.name = 'Claude Code Status';
   statusItem.text = 'Claude: waiting for data';
@@ -119,7 +136,11 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
       lastFingerprint = '';
       void refresh();
-    })
+    }),
+    // Claude conversations opened as editor tabs: switching tabs should move the
+    // status bar to the focused conversation immediately, not on the next poll.
+    vscode.window.tabGroups.onDidChangeTabGroups(() => { lastFingerprint = ''; void refresh(); }),
+    vscode.window.tabGroups.onDidChangeTabs(() => { lastFingerprint = ''; void refresh(); })
   );
 
   startPolling();
@@ -133,7 +154,9 @@ export function deactivate() {
 
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
-  const seconds = vscode.workspace.getConfiguration('claudeVscodeStatus').get<number>('refreshInterval', 2);
+  const cfg = vscode.workspace.getConfiguration('claudeVscodeStatus');
+  debugEnabled = cfg.get<boolean>('debug', false);
+  const seconds = cfg.get<number>('refreshInterval', 2);
   pollTimer = setInterval(() => void refresh(), Math.max(1, seconds) * 1000);
 }
 
@@ -143,6 +166,7 @@ async function refresh() {
     if (!display) {
       statusItem.text = 'Claude: waiting for data';
       statusItem.tooltip = 'No matching Claude VS Code transcript or statusLine cache was found for this workspace. Send a prompt in Claude Code.';
+      statusItem.backgroundColor = undefined;
       return;
     }
 
@@ -153,6 +177,7 @@ async function refresh() {
   } catch (error) {
     statusItem.text = 'Claude: status error';
     statusItem.tooltip = error instanceof Error ? error.message : String(error);
+    statusItem.backgroundColor = undefined;
   }
 }
 
@@ -160,23 +185,41 @@ async function resolveDisplayStatus(): Promise<DisplayStatus | undefined> {
   const roots = workspaceRoots();
   const native = await readNativeTranscriptStatuses(roots);
   const bridge = await readBridgePayloads();
+  const live = await readLiveSessions(roots);
   const pinnedId = extensionContext.workspaceState.get<string>(PINNED_SESSION_KEY);
+
+  const tag = (d: DisplayStatus, via: string): DisplayStatus => { d.via = via; return d; };
 
   if (pinnedId) {
     const pinnedNative = native.find((s) => s.sessionId === pinnedId);
-    if (pinnedNative) return combineNativeWithRates(pinnedNative, bridge, true);
+    if (pinnedNative) return tag(combineNativeWithRates(pinnedNative, bridge, true), 'pinned');
 
     const pinnedBridge = bridge.find((p) => p.session_id === pinnedId);
-    if (pinnedBridge) return bridgeToDisplay(pinnedBridge, true);
+    if (pinnedBridge) return tag(bridgeToDisplay(pinnedBridge, true), 'pinned');
 
     await extensionContext.workspaceState.update(PINNED_SESSION_KEY, undefined);
   }
 
-  // Native Claude Code extension transcripts are authoritative for model/context.
-  // The most recently updated matching transcript is the conversation that most
-  // recently emitted activity in this workspace. A user can pin another one.
+  // Best signal when Claude conversations are opened as editor tabs: the focused
+  // tab's title identifies the conversation the user is actually looking at.
+  const focused = focusedNativeSession(native);
+  if (focused) return tag(combineNativeWithRates(focused, bridge, false), 'focused tab');
+
+  // Otherwise prefer the session Claude reports as live and active in this workspace.
+  // This is the conversation currently doing work, so the bar stops flickering between
+  // two active sessions and does not latch onto a long-dead transcript.
+  const activeId = pickActiveSessionId(live);
+  if (activeId) {
+    const activeNative = native.find((s) => s.sessionId === activeId);
+    if (activeNative) return tag(combineNativeWithRates(activeNative, bridge, false), 'active session');
+    const activeBridge = bridge.find((p) => p.session_id === activeId);
+    if (activeBridge) return tag(bridgeToDisplay(activeBridge, false), 'active session');
+  }
+
+  // No live session file (older Claude, or none in this workspace): fall back to the
+  // most recently updated matching transcript.
   if (native.length > 0) {
-    return combineNativeWithRates(native[0], bridge, false);
+    return tag(combineNativeWithRates(native[0], bridge, false), 'most recent');
   }
 
   const matchingBridge = roots.length > 0 ? bridge.filter((p) => bridgeMatchesWorkspace(p, roots)) : bridge;
@@ -200,6 +243,7 @@ function combineNativeWithRates(native: NativeTranscriptStatus, bridge: BridgePa
     cwd: native.cwd,
     updatedAt: native.updatedAt,
     modelName: native.modelName,
+    title: native.title,
     effort: native.effort,
     usage: native.usage,
     contextTokens: native.contextTokens,
@@ -222,6 +266,7 @@ function bridgeToDisplay(payload: BridgePayload, pinned: boolean): DisplayStatus
     cwd: payload.workspace?.project_dir ?? payload.workspace?.current_dir ?? payload.cwd,
     updatedAt: payload.captured_at,
     modelName: payload.model?.display_name ?? formatModelName(payload.model?.id) ?? 'Claude',
+    title: payload.session_name,
     effort: payload.effort?.level,
     usage: payload.context_window?.current_usage ?? undefined,
     contextTokens: payload.context_window?.total_input_tokens,
@@ -244,9 +289,14 @@ function hasRateLimits(payload: BridgePayload): boolean {
 async function readNativeTranscriptStatuses(roots: string[]): Promise<NativeTranscriptStatus[]> {
   if (roots.length === 0) return [];
   const transcriptFiles = new Set<string>();
+  // Files physically under the workspace's own projects/<encoded> dir belong to this
+  // workspace by construction. Their inner `cwd` field drifts as the agent runs `cd`,
+  // so it must NOT be used to re-filter them.
+  const trustedDirs = new Set<string>();
 
   for (const root of roots) {
     const expected = path.join(PROJECTS_DIR, encodeClaudeProjectPath(root));
+    trustedDirs.add(normalizePath(expected));
     await addJsonlFiles(expected, transcriptFiles);
   }
 
@@ -274,7 +324,8 @@ async function readNativeTranscriptStatuses(roots: string[]): Promise<NativeTran
   withStats.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
   const statuses: NativeTranscriptStatus[] = [];
-  for (const item of withStats.slice(0, 20)) {
+  const diag: string[] = [];
+  for (const item of withStats.slice(0, 50)) {
     const cached = nativeTranscriptCache.get(item.file);
     let parsed: NativeTranscriptStatus | undefined;
     if (cached && cached.mtimeMs === item.mtimeMs) {
@@ -283,11 +334,18 @@ async function readNativeTranscriptStatuses(roots: string[]): Promise<NativeTran
       parsed = await parseNativeTranscript(item.file, item.mtimeMs);
       nativeTranscriptCache.set(item.file, { mtimeMs: item.mtimeMs, status: parsed });
     }
-    if (!parsed) continue;
-    if (!roots.some((root) => pathsOverlap(normalizePath(parsed.cwd), root))) continue;
+    const base = path.basename(item.file).slice(0, 8);
+    if (!parsed) { if (diag.length < 10) diag.push(`${base}=UNPARSED`); continue; }
+    const trusted = trustedDirs.has(normalizePath(path.dirname(item.file)));
+    if (!trusted && !roots.some((root) => pathsOverlap(normalizePath(parsed.cwd), root))) {
+      if (diag.length < 10) diag.push(`${base}=cwd-skip(${parsed.cwd})`);
+      continue;
+    }
+    if (diag.length < 10) diag.push(`${base}="${parsed.title ?? '?'}"`);
     statuses.push(parsed);
   }
   statuses.sort((a, b) => b.updatedAt - a.updatedAt);
+  dbg(`[native] ${transcriptFiles.size} files, ${statuses.length} shown; top: ${diag.join(', ')}`);
   return statuses;
 }
 
@@ -308,6 +366,7 @@ async function parseNativeTranscript(file: string, mtimeMs: number): Promise<Nat
   let latestSessionId: string | undefined;
   let latestCwd: string | undefined;
   let latestVersion: string | undefined;
+  let latestTitle: string | undefined;
 
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();
@@ -318,14 +377,20 @@ async function parseNativeTranscript(file: string, mtimeMs: number): Promise<Nat
     if (!latestSessionId && typeof obj.sessionId === 'string') latestSessionId = obj.sessionId;
     if (!latestCwd && typeof obj.cwd === 'string') latestCwd = obj.cwd;
     if (!latestVersion && typeof obj.version === 'string') latestVersion = obj.version;
+    // Claude writes the conversation title in its own 'ai-title' lines; scanning
+    // from the end, the first one we meet is the latest title.
+    if (!latestTitle && obj.type === 'ai-title' && typeof obj.aiTitle === 'string' && obj.aiTitle.trim()) {
+      latestTitle = obj.aiTitle.trim();
+    }
 
     if (!latestAssistant && obj.type === 'assistant' && obj.entrypoint === 'claude-vscode' && obj.message && typeof obj.message === 'object') {
       latestAssistant = obj;
       latestSessionId = typeof obj.sessionId === 'string' ? obj.sessionId : latestSessionId;
       latestCwd = typeof obj.cwd === 'string' ? obj.cwd : latestCwd;
       latestVersion = typeof obj.version === 'string' ? obj.version : latestVersion;
-      break;
     }
+
+    if (latestAssistant && latestTitle) break;
   }
 
   if (!latestAssistant || !latestSessionId || !latestCwd) return undefined;
@@ -346,15 +411,21 @@ async function parseNativeTranscript(file: string, mtimeMs: number): Promise<Nat
   const contextWindowSize = discoveredWindow ?? configuredDefault;
 
   const modelId = typeof latestAssistant.message?.model === 'string' ? latestAssistant.message.model : undefined;
+  // Rank by the last real assistant turn, not the file mtime: an idle-but-live Claude
+  // process keeps touching its transcript (heartbeats), which made a days-old session
+  // look like the freshest one.
+  const turnMs = Date.parse(typeof latestAssistant.timestamp === 'string' ? latestAssistant.timestamp : '');
+  const updatedAt = Number.isFinite(turnMs) ? turnMs / 1000 : mtimeMs / 1000;
   return {
     source: 'native',
     sessionId: latestSessionId,
     cwd: latestCwd,
     transcriptPath: file,
-    updatedAt: mtimeMs / 1000,
+    updatedAt,
     entrypoint: 'claude-vscode',
     modelId,
     modelName: formatModelName(modelId) ?? modelId ?? 'Claude',
+    title: latestTitle,
     effort: typeof latestAssistant.effort === 'string' ? latestAssistant.effort : undefined,
     usage,
     contextTokens,
@@ -425,6 +496,94 @@ function pathsOverlap(a: string, b: string): boolean {
   return a === b || a.startsWith(b + path.sep) || b.startsWith(a + path.sep);
 }
 
+// Claude Code writes one sessions/<pid>.json per live conversation process, with a
+// busy/idle status. Reading these lets us track the session that is actually active
+// in this workspace, instead of guessing from transcript file mtimes (which also
+// counts long-dead sessions and flickers between two live ones).
+async function readLiveSessions(roots: string[]): Promise<LiveSession[]> {
+  let entries: string[];
+  try {
+    entries = await fs.promises.readdir(SESSIONS_DIR);
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
+  }
+  const out: LiveSession[] = [];
+  for (const entry of entries) {
+    if (!entry.endsWith('.json')) continue;
+    try {
+      const raw = await fs.promises.readFile(path.join(SESSIONS_DIR, entry), 'utf8');
+      const s = JSON.parse(raw);
+      if (!s || s.entrypoint !== 'claude-vscode' || typeof s.sessionId !== 'string') continue;
+      if (typeof s.pid === 'number' && !pidAlive(s.pid)) continue;
+      if (roots.length > 0 && typeof s.cwd === 'string' && !roots.some((r) => pathsOverlap(normalizePath(s.cwd), r))) continue;
+      out.push({ sessionId: s.sessionId, cwd: s.cwd, status: s.status, statusUpdatedAt: s.statusUpdatedAt, updatedAt: s.updatedAt });
+    } catch {
+      // A session file can be mid-write; the next poll retries.
+    }
+  }
+  return out;
+}
+
+// The title of the active editor tab. We return the label for any tab type and let
+// title-matching decide; an earlier instanceof TabInputWebview gate wrongly excluded
+// Claude's conversation tabs in some layouts, so focus never followed.
+function focusedTabTitle(): string | undefined {
+  const tab = vscode.window.tabGroups.activeTabGroup?.activeTab;
+  if (!tab || typeof tab.label !== 'string' || !tab.label.trim()) return undefined;
+  return tab.label.trim();
+}
+
+let lastTabLog = '';
+function logTabs() {
+  const parts: string[] = [];
+  for (const g of vscode.window.tabGroups.all) {
+    for (const t of g.tabs) {
+      const kind = (t.input as any)?.constructor?.name ?? (t.input === undefined ? 'undefined' : typeof t.input);
+      const vt = (t.input as any)?.viewType;
+      const active = g.isActive && t.isActive ? '*ACTIVE* ' : '';
+      parts.push(`${active}[${kind}${vt ? ':' + vt : ''}] "${t.label}"`);
+    }
+  }
+  const line = parts.length ? parts.join('  |  ') : '(no tabs)';
+  if (line !== lastTabLog) { lastTabLog = line; dbg('[tabs] ' + line); }
+}
+
+// Match the focused conversation tab to a parsed transcript by its title. VS Code
+// truncates tab labels with a trailing ellipsis ("Глобальная система Conte…"), so we
+// strip that and match the parsed title by prefix.
+function focusedNativeSession(native: NativeTranscriptStatus[]): NativeTranscriptStatus | undefined {
+  logTabs();
+  const raw = focusedTabTitle();
+  if (!raw) { dbg('[focus] no active tab label'); return undefined; }
+  const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, ' ');
+  const want = norm(raw.replace(/[…\s.]+$/, '')); // drop trailing ellipsis/dots/space
+  if (!want) return undefined;
+  const hit = native.find((s) => s.title && norm(s.title) === want)
+    ?? native.find((s) => s.title && norm(s.title).startsWith(want))
+    ?? native.find((s) => s.title && want.startsWith(norm(s.title)));
+  dbg(`[focus] active tab = "${raw}" (prefix "${want}") -> ${hit ? 'MATCH ' + shortSession(hit.sessionId) : 'no match'}`);
+  return hit;
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error: any) {
+    return error?.code === 'EPERM'; // exists but not ours to signal
+  }
+}
+
+// The active session: a busy one wins over idle; ties break on the most recent
+// status update. This locks onto the conversation that is currently working.
+function pickActiveSessionId(live: LiveSession[]): string | undefined {
+  if (live.length === 0) return undefined;
+  const busyScore = (s: LiveSession) => (s.status === 'busy' ? 1 : 0);
+  const stamp = (s: LiveSession) => s.statusUpdatedAt ?? s.updatedAt ?? 0;
+  return [...live].sort((a, b) => busyScore(b) - busyScore(a) || stamp(b) - stamp(a))[0].sessionId;
+}
+
 async function readBridgePayloads(): Promise<BridgePayload[]> {
   let entries: string[];
   try {
@@ -459,6 +618,8 @@ async function selectSession() {
   const roots = workspaceRoots();
   const native = await readNativeTranscriptStatuses(roots);
   const bridge = await readBridgePayloads();
+  const live = await readLiveSessions(roots);
+  const liveStatus = new Map(live.map((s) => [s.sessionId, s.status === 'busy' ? '$(pulse) active' : '$(circle-filled) live']));
   const pinnedId = extensionContext.workspaceState.get<string>(PINNED_SESSION_KEY);
 
   const items: Array<vscode.QuickPickItem & { sessionId?: string; clear?: boolean }> = [{
@@ -469,9 +630,11 @@ async function selectSession() {
   }];
 
   for (const s of native) {
+    const head = s.title ?? s.modelName;
+    const liveTag = liveStatus.get(s.sessionId);
     items.push({
-      label: `${s.sessionId === pinnedId ? '$(pin) ' : ''}${s.modelName}${s.effort ? ` (${formatEffort(s.effort)})` : ''}`,
-      description: `Native VS Code · ${shortSession(s.sessionId)}`,
+      label: `${s.sessionId === pinnedId ? '$(pin) ' : ''}${head}`,
+      description: `${liveTag ? liveTag + ' · ' : ''}${s.modelName}${s.effort ? ` (${formatEffort(s.effort)})` : ''} · ${shortSession(s.sessionId)}`,
       detail: `${s.cwd} · Context ${formatTokenCount(s.contextTokens)}/${formatTokenCount(s.contextWindowSize)} · ${formatAge(s.updatedAt)}`,
       sessionId: s.sessionId
     });
@@ -479,9 +642,10 @@ async function selectSession() {
 
   const nativeIds = new Set(native.map((s) => s.sessionId));
   for (const p of bridge.filter((p) => p.session_id && !nativeIds.has(p.session_id) && (roots.length === 0 || bridgeMatchesWorkspace(p, roots)))) {
+    const model = p.model?.display_name ?? formatModelName(p.model?.id) ?? 'Claude';
     items.push({
-      label: `${p.session_id === pinnedId ? '$(pin) ' : ''}${p.model?.display_name ?? formatModelName(p.model?.id) ?? 'Claude'}${p.effort?.level ? ` (${formatEffort(p.effort.level)})` : ''}`,
-      description: `CLI/statusLine · ${shortSession(p.session_id)}`,
+      label: `${p.session_id === pinnedId ? '$(pin) ' : ''}${p.session_name ?? model}`,
+      description: `${model}${p.effort?.level ? ` (${formatEffort(p.effort.level)})` : ''} · CLI/statusLine · ${shortSession(p.session_id)}`,
       detail: `${p.cwd ?? p.workspace?.project_dir ?? 'unknown directory'} · ${formatAge(p.captured_at)}`,
       sessionId: p.session_id
     });
@@ -518,9 +682,39 @@ function render(status: DisplayStatus) {
   if (showTokens && typeof status.contextTokens === 'number' && typeof status.contextWindowSize === 'number') {
     context += ` · ${formatTokenCount(status.contextTokens)}/${formatTokenCount(status.contextWindowSize)}`;
   }
-  segments.push(context, `5h ${roundPct(status.fiveHour?.used_percentage) ?? '–'}%`, `7d ${roundPct(status.sevenDay?.used_percentage) ?? '–'}%`);
+  segments.push(context);
+  // Only show 5h/7d when the bridge has actually emitted them; otherwise they just
+  // read "-%" and clutter the bar.
+  const five = roundPct(status.fiveHour?.used_percentage);
+  const seven = roundPct(status.sevenDay?.used_percentage);
+  if (typeof five === 'number') segments.push(`5h ${five}%`);
+  if (typeof seven === 'number') segments.push(`7d ${seven}%`);
   statusItem.text = segments.join(' │ ');
   statusItem.tooltip = buildTooltip(status);
+  applyThresholdColor(status.contextTokens);
+}
+
+// Tint the status bar at our context-handoff thresholds (token-based, so it lines
+// up with the handoff nudges regardless of the fallback window size). VS Code only
+// renders warningBackground (yellow) and errorBackground (red).
+// Three escalating tiers. VS Code only renders two status-bar *background* colors
+// (warning = orange, error = red), so the lowest tier (yellow) is shown as yellow
+// text instead of a fill: yellow text -> orange fill -> red fill.
+function applyThresholdColor(contextTokens: number | undefined) {
+  const cfg = vscode.workspace.getConfiguration('claudeVscodeStatus');
+  const warn = cfg.get<number>('warnTokens', 150000);  // yellow text from here
+  const hot = cfg.get<number>('hotTokens', 200000);    // orange fill from here
+  const error = cfg.get<number>('errorTokens', 256000); // red fill from here
+  statusItem.backgroundColor = undefined;
+  statusItem.color = undefined;
+  if (typeof contextTokens !== 'number') return;
+  if (error > 0 && contextTokens >= error) {
+    statusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+  } else if (hot > 0 && contextTokens >= hot) {
+    statusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+  } else if (warn > 0 && contextTokens >= warn) {
+    statusItem.color = new vscode.ThemeColor('charts.yellow'); // yellow text tier
+  }
 }
 
 function buildTooltip(status: DisplayStatus): vscode.MarkdownString {
@@ -528,6 +722,8 @@ function buildTooltip(status: DisplayStatus): vscode.MarkdownString {
   md.isTrusted = false;
   md.appendMarkdown('**Claude Code Status**\n\n');
   md.appendMarkdown(`Source: **${escapeMd(status.sourceDetail)}**${status.pinned ? ' _(pinned)_' : ' _(auto)_'}  \n`);
+  if (status.via) md.appendMarkdown(`Selected via: **${escapeMd(status.via)}**  \n`);
+  if (status.title) md.appendMarkdown(`Title: **${escapeMd(status.title)}**  \n`);
   if (status.sessionId) md.appendMarkdown(`Session: **${escapeMd(shortSession(status.sessionId))}**  \n`);
   md.appendMarkdown(`Model: **${escapeMd(status.modelName)}**${status.effort ? ` (${escapeMd(formatEffort(status.effort) ?? status.effort)})` : ''}\n\n`);
 
@@ -590,7 +786,7 @@ function formatModelName(modelId: string | undefined): string | undefined {
 
 function formatTokenCount(value: number | undefined): string {
   if (typeof value !== 'number') return '–';
-  if (value >= 1_000_000) return `${trimZero((value / 1_000_000).toFixed(1))}m`;
+  if (value >= 1_000_000) return `${trimZero((value / 1_000_000).toFixed(1))}M`;
   if (value >= 1_000) return `${trimZero((value / 1_000).toFixed(1))}k`;
   return String(Math.round(value));
 }

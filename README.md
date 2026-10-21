@@ -1,186 +1,196 @@
-# Claude VS Code Status
+# Claude VS Code Status (biospb fork)
 
-A small, local-only VS Code extension that shows useful Claude Code session information directly in the VS Code status bar.
+A small, local-only VS Code extension that shows Claude Code session information in the VS Code status bar.
 
 ```text
-Opus 5 (High) │ Context 4% · 38.9k/1m │ 5h 45% │ 7d 5%
+Opus 5 (High) │ Context 4% · 38.9k/1M │ 5h 45% │ 7d 5%
 ```
 
-Claude VS Code Status is designed to be transparent and easy to audit. It does not sign in to your Anthropic account, call unofficial APIs, send telemetry, or upload your conversations anywhere.
+This is a fork of [E-MRE/claude-vscode-status](https://github.com/E-MRE/claude-vscode-status). It keeps the upstream behaviour and privacy model and makes the status bar **follow the conversation you are looking at**. With several Claude conversations open in one workspace, upstream often showed the wrong one.
+
+It does not sign in to your Anthropic account, call unofficial APIs, send telemetry, or upload your conversations anywhere.
+
+## What this fork changes
+
+### Follows the focused conversation
+
+When Claude conversations are open as editor tabs, the status bar shows the conversation in the **focused tab**. Switch tabs and the status bar switches with you.
+
+The extension reads each conversation's title from its transcript (`ai-title` lines) and matches it to the active tab's label. VS Code shortens long tab labels with `…`, so the match is by prefix.
+
+### Better automatic session detection
+
+The extension picks a session in this order:
+
+| Priority | Source | Shown in tooltip as |
+|---|---|---|
+| 1 | Session you pinned manually | `pinned` |
+| 2 | Conversation in the focused editor tab | `focused tab` |
+| 3 | Live, busy Claude process for this workspace (`~/.claude/sessions/<pid>.json`) | `active session` |
+| 4 | Transcript with the most recent assistant reply | `most recent` |
+
+Fixes compared to upstream:
+
+- **No more flicker** between two running conversations. A live, busy session is preferred.
+- **Ranks by the last real assistant reply**, not by file modification time. An idle Claude process keeps touching its transcript, which made a days-old session look newest.
+- **Trusts the workspace's own transcript folder** (`~/.claude/projects/<encoded-workspace>/`). Upstream filtered by the transcript's working directory, which changes whenever the agent runs `cd`, so active sessions were sometimes skipped.
+
+### Three color levels for context size
+
+The status item changes color as the context grows, so you know when to start a fresh conversation:
+
+| Context tokens | Look | Setting |
+|---|---|---|
+| ≥ 150k | yellow text | `claudeVscodeStatus.warnTokens` |
+| ≥ 200k | orange background | `claudeVscodeStatus.hotTokens` |
+| ≥ 256k | red background | `claudeVscodeStatus.errorTokens` |
+
+The levels use token counts, not percentages, so they behave the same whatever the context window size. Set any of them to `0` to turn it off.
+
+### Smaller changes
+
+- The session picker and tooltip show the **conversation title**. Live sessions are marked in the picker.
+- The tooltip has a **Selected via** line that tells you why this session was chosen.
+- The `5h` / `7d` parts are **hidden** until the usage bridge sends data, instead of showing `–%`.
+- Million-token counts use an uppercase `M` (`1M`).
+- New `claudeVscodeStatus.debug` setting writes session-detection details to the **Claude Code Status** output channel.
 
 ## What it shows
 
-The status bar can display:
-
 - Active Claude model, for example `Opus 5` or `Sonnet 5`
 - Effort level, when Claude exposes it
-- Current context-window usage as a percentage
+- Context-window usage as a percentage
 - Current context tokens and context-window size
-- 5-hour usage percentage
-- 7-day usage percentage
+- 5-hour and 7-day usage percentage (needs the optional bridge)
 
-Hover over the status item for more detail, including fresh input tokens, cache-write tokens, cache-read tokens, last output tokens, rate-limit reset times, Claude Code version, data source, and the selected session.
+Hover over the status item for details: conversation title, fresh input tokens, cache-write and cache-read tokens, last output tokens, rate-limit reset times, Claude Code version, data source, the selected session, and why it was selected.
 
 ## How it works
 
-The extension uses two local data sources.
+The extension uses local files only.
 
 ### Native Claude Code for VS Code
 
-For conversations started in the official Claude Code VS Code extension, model, effort, and token metadata are read from Claude Code's local transcript files under your home directory:
+For conversations in the official Claude Code VS Code extension, model, effort, token, and title data are read from Claude Code's transcripts:
 
 ```text
 ~/.claude/projects/
 ```
 
-Only the metadata needed to build the status display is retained in memory. The extension does not transmit transcript contents.
+Live-session information comes from:
+
+```text
+~/.claude/sessions/
+```
+
+Only the data needed for the status display is kept in memory. Transcript contents are never sent anywhere.
 
 ### Optional 5h / 7d usage bridge
 
-Claude's native VS Code transcript does not currently expose the account-level 5-hour and 7-day usage fields used by this extension. To obtain those values, Claude VS Code Status can install a small local `statusLine` bridge in Claude Code.
+Claude's native VS Code transcript does not include account-level 5-hour and 7-day usage. To get these values, the extension can install a small local `statusLine` bridge in Claude Code. On first run, VS Code asks whether you want to enable it.
 
-On first run, VS Code asks whether you want to enable this bridge. No terminal commands are required.
+If you enable it, the extension:
 
-If enabled, the extension:
-
-1. Creates a backup of `~/.claude/settings.json`.
-2. Writes a small local bridge under `~/.claude/vscode-status/`.
+1. Backs up `~/.claude/settings.json`.
+2. Writes a small bridge script under `~/.claude/vscode-status/`.
 3. Registers it as Claude Code's `statusLine` command.
-4. Stores only the status metadata needed by the extension in `~/.claude/vscode-status/sessions/`.
+4. Stores only the needed status data in `~/.claude/vscode-status/sessions/`.
 
-If another `statusLine` is already configured, the extension will not silently replace it. It asks for confirmation and saves the previous configuration so it can be restored later.
+If you already have a `statusLine`, the extension asks before replacing it and saves the old one so it can be restored.
 
-The bridge can be removed at any time with **Claude Status: Disable Usage Bridge and Restore Previous StatusLine**.
+Remove the bridge at any time with **Claude Status: Disable Usage Bridge and Restore Previous StatusLine**.
 
 ## Installation
 
-### From a VSIX
+This fork is not on the VS Code Marketplace. The Marketplace extension **Claude VS Code Status** by **E-MRE** is the upstream version, without the changes above.
 
-1. Download the `.vsix` release.
-2. Open VS Code.
-3. Open **Extensions**.
-4. Open the `...` menu and choose **Install from VSIX...**.
-5. Select the downloaded file.
-6. Reload VS Code if prompted.
+### Build a VSIX
 
-No shell, `jq`, Python, or manual setup commands are required.
+```bash
+git clone https://github.com/biospb/claude-vscode-status.git
+cd claude-vscode-status
+npm install
+npx @vscode/vsce package
+```
 
-### VS Code Marketplace
+Then in VS Code: **Extensions** → `...` menu → **Install from VSIX...** → select the generated `.vsix` file, and reload if asked.
 
-Install directly from the VS Code Extensions view by searching for:
-
-**Claude VS Code Status**
-
-Publisher: **E-MRE**
-
-You can also install it from the Visual Studio Marketplace once the extension is published there.
-
-## First run
-
-Open a project in VS Code and use Claude Code normally. After Claude produces a response, the status item should appear automatically.
-
-The extension may ask once whether you want to enable the optional 5h/7d usage bridge. Choose **Enable 5h/7d** if you want those fields. Model and context information can work without the bridge for native VS Code conversations.
+If you have the Marketplace version installed, uninstall it first. Both use the same extension ID.
 
 ## Multiple Claude conversations
 
-Claude Code may have several conversations associated with the same workspace. By default, Claude VS Code Status selects the most recently active matching native conversation.
+By default the status bar follows the focused conversation tab, then the busy session, then the most recent one (see the table above).
 
-Click the status-bar item to select and pin a specific conversation. Use **Claude Status: Clear Session Pin (Auto-detect)** to return to automatic selection.
+Click the status item to pick and pin a specific conversation. Run **Claude Status: Clear Session Pin (Auto-detect)** to go back to automatic selection.
 
 ## Commands
 
-Open the VS Code Command Palette and search for `Claude Status`:
+Open the Command Palette and type `Claude Status`:
 
-- **Claude Status: Enable/Update 5h & 7d Usage Bridge** — installs or updates the local rate-limit bridge.
-- **Claude Status: Refresh** — immediately refreshes the display.
-- **Claude Status: Select/Pin Session** — selects a Claude conversation for the current VS Code workspace.
-- **Claude Status: Clear Session Pin (Auto-detect)** — returns to automatic conversation selection.
-- **Claude Status: Disable Usage Bridge and Restore Previous StatusLine** — removes the bridge and restores the previous Claude `statusLine` configuration when available.
+- **Enable/Update 5h & 7d Usage Bridge**: installs or updates the local bridge.
+- **Refresh**: updates the display now.
+- **Select/Pin Session**: picks a Claude conversation for this workspace.
+- **Clear Session Pin (Auto-detect)**: goes back to automatic selection.
+- **Disable Usage Bridge and Restore Previous StatusLine**: removes the bridge and restores the previous `statusLine`.
 
 ## Settings
 
-### `claudeVscodeStatus.refreshInterval`
-
-How often, in seconds, the extension checks local Claude files. Default: `2`.
-
-This does not make network requests.
-
-### `claudeVscodeStatus.showTokens`
-
-Show token counts next to the context percentage. Default: `true`.
-
-### `claudeVscodeStatus.defaultContextWindowSize`
-
-Fallback context-window size when a native transcript does not expose an explicit size. Default: `1000000`.
-
-When the fallback is used, the tooltip labels the window size as a fallback.
+| Setting | Default | Description |
+|---|---|---|
+| `claudeVscodeStatus.refreshInterval` | `2` | Seconds between checks of local files. No network requests. |
+| `claudeVscodeStatus.showTokens` | `true` | Show token counts next to the context percentage. |
+| `claudeVscodeStatus.defaultContextWindowSize` | `1000000` | Context window size to use when the transcript does not say. The tooltip marks it as a fallback. |
+| `claudeVscodeStatus.warnTokens` | `150000` | Yellow text from this many context tokens. `0` turns it off. |
+| `claudeVscodeStatus.hotTokens` | `200000` | Orange background from this many context tokens. `0` turns it off. |
+| `claudeVscodeStatus.errorTokens` | `256000` | Red background from this many context tokens. `0` turns it off. |
+| `claudeVscodeStatus.debug` | `false` | Write session-detection details to the **Claude Code Status** output channel. |
 
 ## Platform support
 
-Version 1.1.1 is designed for:
-
-- macOS — primary tested platform
-- Linux — supported by the same POSIX bridge and platform-independent path handling
-- Windows — supported with a PowerShell bridge and Windows path handling
-
-No user-entered terminal commands are required on any platform. Because macOS is the primary tested environment for the initial public release, Windows and Linux users are encouraged to report compatibility issues with their Claude Code version and VS Code version.
+- Windows: the fork is developed and tested here (PowerShell bridge).
+- macOS: the main platform upstream.
+- Linux: uses the same POSIX bridge as macOS.
 
 ## Privacy and security
 
-Claude VS Code Status is intentionally local-only:
+The extension is local-only:
 
-- No telemetry
-- No analytics
-- No external network requests
-- No Anthropic credentials are requested or stored
-- No cookies are read
-- No unofficial Claude API is used
-- No conversation data is uploaded
+- No telemetry or analytics
+- No network requests
+- No Anthropic credentials requested or stored
+- No cookies read
+- No unofficial Claude API used
+- No conversation data uploaded
 
-The extension reads local Claude Code transcript metadata to determine the active model and token usage. The optional bridge receives Claude Code's `statusLine` JSON locally and writes a reduced metadata object to a local cache.
+The optional bridge receives Claude Code's `statusLine` JSON locally and writes a reduced copy to `~/.claude/vscode-status/`. Bridge cache entries older than seven days are deleted automatically.
 
-The cache directory is:
+## Compatibility note
 
-```text
-~/.claude/vscode-status/
-```
+The files under `~/.claude` (transcripts, `sessions/*.json`, `ai-title` lines) are internal to Claude Code and can change between releases. The parser is careful, but a Claude Code update may break detection until the extension is updated. Focused-tab matching also depends on how the Claude extension titles its tabs.
 
-Bridge cache entries older than seven days are cleaned up automatically when the bridge runs.
-
-## Important compatibility note
-
-The native transcript format under `~/.claude` is an implementation detail of Claude Code and may change between Claude Code releases. The parser is intentionally defensive, but a future Claude Code update may temporarily break native transcript detection until the extension is updated.
-
-The 5h/7d fields also depend on Claude Code exposing rate-limit information to its `statusLine` input.
+The 5h/7d fields depend on Claude Code including rate-limit data in its `statusLine` input.
 
 ## Troubleshooting
 
-If the status bar says `Claude: waiting for data`, send a message in the Claude Code panel and wait for the response to complete. Then run **Claude Status: Refresh**.
-
-If the wrong conversation is selected, click the status item and pin the correct session.
-
-If model/context works but `5h –% │ 7d –%` is shown, enable the usage bridge from the Command Palette. Rate-limit values appear after Claude Code emits status data.
-
-If you already use a custom Claude Code `statusLine`, review the confirmation dialog carefully before enabling the usage bridge. The extension always attempts to preserve and restore the previous configuration.
+- **`Claude: waiting for data`**: send a message in Claude Code, wait for the reply, then run **Claude Status: Refresh**.
+- **Wrong conversation shown**: hover the status item and check **Selected via**. If it isn't what you expect, turn on `claudeVscodeStatus.debug` and check the **Claude Code Status** output channel, or click the status item and pin the right session.
+- **No 5h / 7d values**: enable the usage bridge from the Command Palette. Values appear after Claude Code sends status data.
+- **You already use a custom `statusLine`**: read the confirmation dialog before enabling the bridge. The extension saves your configuration and restores it when the bridge is removed.
 
 ## Development
 
-Requirements:
-
-- Node.js
-- npm
-- VS Code
-
-Install dependencies and compile:
+Requires Node.js, npm, and VS Code.
 
 ```bash
 npm install
-npm run compile
+npm run compile   # or: npm run watch
 ```
 
-Press `F5` in VS Code to launch an Extension Development Host.
+Press `F5` in VS Code to start an Extension Development Host. The code is in [src/extension.ts](src/extension.ts).
 
-Marketplace releases are published under the `E-MRE` publisher using the official VS Code extension tooling.
+## Credits
+
+Original extension by [E-MRE](https://github.com/E-MRE/claude-vscode-status). Fork changes by [biospb](https://github.com/biospb/claude-vscode-status).
 
 ## License
 
@@ -188,4 +198,4 @@ MIT. See [LICENSE](LICENSE).
 
 ## Disclaimer
 
-This is an independent community project and is not affiliated with, endorsed by, or sponsored by Anthropic. Claude and Claude Code are trademarks of their respective owner.
+This is an independent community project. It is not affiliated with, endorsed by, or sponsored by Anthropic. Claude and Claude Code are trademarks of their owner.
